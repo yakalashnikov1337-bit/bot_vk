@@ -51,6 +51,8 @@ def init_db():
             last_work TEXT,
             last_mine TEXT,
             last_rob TEXT,
+            last_bank_rob TEXT,
+            last_treasury_rob TEXT,
             last_exp TEXT,
             bank REAL DEFAULT 0,
             vip BOOLEAN DEFAULT 0,
@@ -149,6 +151,35 @@ def fmt_big(amount):
         return f"{int(amount)}" if amount == int(amount) else f"{amount:.2f}"
     return f"{int(amount)}" if amount == int(amount) else f"{amount:.2f}".rstrip('0').rstrip('.')
 
+def fmt_time(td):
+    total_seconds = int(td.total_seconds())
+    if total_seconds < 60:
+        return f"{total_seconds} сек"
+    elif total_seconds < 3600:
+        return f"{total_seconds // 60} мин {total_seconds % 60} сек"
+    else:
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        return f"{hours} ч {minutes} мин"
+
+def can_rob(uid, field, hours):
+    user = get_user(uid)
+    if not user or not user[field]:
+        return True, None
+    last = datetime.strptime(user[field], "%Y-%m-%d %H:%M:%S")
+    delta = timedelta(hours=hours)
+    if datetime.now() - last >= delta:
+        return True, None
+    else:
+        next_time = last + delta
+        remaining = next_time - datetime.now()
+        return False, remaining
+
+def set_rob_time(uid, field):
+    with sqlite3.connect(DB_NAME) as c:
+        c.execute(f"UPDATE users SET {field}=? WHERE id=?", (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), uid))
+        c.commit()
+
 def get_user_profile(api, uid):
     user = get_user(uid)
     if not user:
@@ -223,10 +254,58 @@ def handle_message(api, event):
     cmd = parts[0].lower().lstrip('/')
     ADMIN_IDS = load_admin_ids()
 
+    # ========== МЕНЮ ==========
     if cmd == "меню" or cmd == "профиль":
         send(api, uid, get_user_profile(api, uid), peer_id)
         return
 
+    # ========== ОГРАБИТЬ БАНК ==========
+    if cmd == "ограбить банк" or cmd == "robank":
+        ok, remaining = can_rob(uid, 'last_bank_rob', 3)
+        if not ok:
+            send(api, uid, f"🚔 ПОЛИЦИЯ ЗА ВАМИ УЖЕ ЕДЕТ! 🚔\nВы не можете грабить банк ещё {fmt_time(remaining)}", peer_id)
+            return
+        
+        success = random.random() < 0.4  # 40% шанс успеха
+        
+        if success:
+            reward = random.randint(30000, 80000)
+            update_balance(uid, reward)
+            set_rob_time(uid, 'last_bank_rob')
+            send(api, uid, f"🏦💰 ОГРАБЛЕНИЕ БАНКА УДАЛОСЬ! 💰🏦\n\nВы ворвались в банк, взломали сейф и украли {fmt_big(reward)}$!\n\n🕵️ Следы заметены, полиция не успела!", peer_id)
+            update_experience(uid, 50)
+        else:
+            penalty = random.randint(15000, 40000)
+            update_balance(uid, -penalty)
+            set_rob_time(uid, 'last_bank_rob')
+            send(api, uid, f"🚨🚔 ОГРАБЛЕНИЕ ПРОВАЛИЛОСЬ! 🚔🚨\n\nСработала сигнализация! Приехала полиция, вас оштрафовали на {fmt_big(penalty)}$!\n\n😭 Полиция за вами уже едет...", peer_id)
+            update_experience(uid, 10)
+        return
+
+    # ========== ОГРАБИТЬ КАЗНУ ==========
+    if cmd == "ограбить казну" or cmd == "rotres":
+        ok, remaining = can_rob(uid, 'last_treasury_rob', 2)
+        if not ok:
+            send(api, uid, f"🏛️🚔 ПОЛИЦИЯ ЗА ВАМИ УЖЕ ЕДЕТ! 🚔🏛️\nВы не можете грабить казну ещё {fmt_time(remaining)}", peer_id)
+            return
+        
+        success = random.random() < 0.5  # 50% шанс успеха
+        
+        if success:
+            reward = random.randint(15000, 45000)
+            update_balance(uid, reward)
+            set_rob_time(uid, 'last_treasury_rob')
+            send(api, uid, f"🏛️💰 ОГРАБЛЕНИЕ КАЗНЫ УДАЛОСЬ! 💰🏛️\n\nВы пробрались в государственную казну и украли {fmt_big(reward)}$!\n\n🦹 Никто не заметил!", peer_id)
+            update_experience(uid, 30)
+        else:
+            penalty = random.randint(5000, 20000)
+            update_balance(uid, -penalty)
+            set_rob_time(uid, 'last_treasury_rob')
+            send(api, uid, f"🚨🏛️ ОГРАБЛЕНИЕ ПРОВАЛИЛОСЬ! 🏛️🚨\n\nОхрана казны заметила вас! Штраф: {fmt_big(penalty)}$!\n\n👮 Полиция уже в пути!", peer_id)
+            update_experience(uid, 5)
+        return
+
+    # ========== БАНК (ПОЛОЖИТЬ/СНЯТЬ) ==========
     if cmd == "банк" and len(parts) >= 2:
         action = parts[1].lower()
         if action == "положить" and len(parts) >= 3:
@@ -263,10 +342,12 @@ def handle_message(api, event):
             send(api, uid, f"🏦 В банке: {fmt_big(user['bank'])}$\n/банк положить [сумма]\n/банк снять [сумма]", peer_id)
         return
 
+    # ========== МАГАЗИН ==========
     if cmd in ["shop", "магазин"]:
         send(api, uid, "🛒 МАГАЗИН 🛒\n\nB-Coins — 1000$\nБиткоин — 25000$\nРейтинг — 10000$\nVIP — 100000$\n\n/buy [товар] [кол-во]\nТовары: bcoin, bitcoin, rating, vip", peer_id)
         return
 
+    # ========== ПОКУПКА ==========
     if cmd == "buy" and len(parts) >= 2:
         item = parts[1].lower()
         amount = 1
@@ -320,6 +401,7 @@ def handle_message(api, event):
             send(api, uid, "❌ Товары: bcoin, bitcoin, rating, vip", peer_id)
         return
 
+    # ========== КАЗИНО ==========
     if cmd == "казино" and len(parts) >= 2:
         try:
             bet = float(parts[1].replace(',', '.'))
@@ -349,6 +431,21 @@ def handle_message(api, event):
             send(api, uid, "❌ /казино 100", peer_id)
         return
 
+    # ========== ПОМОЩЬ ==========
+    if cmd in ["help", "команды"]:
+        help_text = (
+            "🎮 КОМАНДЫ БОТА 🎮\n\n"
+            "👤 Профиль:\n/меню — твой профиль\n\n"
+            "🏦 Финансы:\n/банк положить [сумма]\n/банк снять [сумма]\n/топ — топ богачей\n\n"
+            "🛒 Магазин:\n/shop — магазин\n/buy [товар] [кол-во]\n\n"
+            "🎰 Казино:\n/казино [сумма] — игра в слоты (+10 опыта)\n\n"
+            "🦹‍♂️ ГРАБЁЖ (рандом, раз в 2-3 часа):\n/ограбить банк — 40% успеха (ждём 3ч)\n/ограбить казну — 50% успеха (ждём 2ч)\n\n"
+            "👑 Админ:\n/кик — исключить из беседы\n/givemoney [id] [сумма]"
+        )
+        send(api, uid, help_text, peer_id)
+        return
+
+    # ========== КИК (АДМИН) ==========
     if cmd == "кик":
         if not chat_id:
             send(api, uid, "❌ Только в беседах", peer_id)
@@ -378,6 +475,7 @@ def handle_message(api, event):
                 send(api, uid, "❌ Ошибка", peer_id)
         return
 
+    # ========== GIVEMONEY (АДМИН) ==========
     if cmd == "givemoney" and len(parts) >= 3:
         if uid not in ADMIN_IDS:
             send(api, uid, "⛔ Нет прав", peer_id)
@@ -399,6 +497,7 @@ def handle_message(api, event):
         send(api, uid, f"✅ Выдал {fmt_big(amount)}$ {target_user['username']}", peer_id)
         return
 
+    # ========== ТОП ==========
     if cmd == "топ" or cmd == "top":
         with sqlite3.connect(DB_NAME) as c:
             c.row_factory = sqlite3.Row
@@ -406,14 +505,10 @@ def handle_message(api, event):
         if not top:
             send(api, uid, "📊 Топ пуст", peer_id)
             return
-        msg = "💰 ТОП-10 💰\n"
+        msg = "💰 ТОП-10 БОГАЧЕЙ 💰\n\n"
         for i, u in enumerate(top, 1):
             msg += f"{i}. {u['username']} — {fmt_big(u['balance'])}$\n"
         send(api, uid, msg, peer_id)
-        return
-
-    if cmd in ["help", "команды"]:
-        send(api, uid, "🎮 КОМАНДЫ 🎮\n/меню\n/казино [сумма]\n/банк положить/снять\n/shop\n/buy [товар]\n/топ\n/кик (админ)\n/givemoney [id] (админ)", peer_id)
         return
 
 def main():
