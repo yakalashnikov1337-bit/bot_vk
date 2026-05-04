@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
 import random, sqlite3, logging, time, re, json
 from datetime import datetime, timedelta
 
 from vk_api import VkApi
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
+from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 from vk_api.utils import get_random_id
 
 # ---------- КОНФИГ ----------
@@ -21,6 +21,13 @@ DB_NAME = "casino_vk.db"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Словарь с автомобилями
+CARS = {
+    "1": {"name": "Самокат", "price": 10000, "image": "https://avatars.mds.yandex.net/i?id=c6b01f469c7fc1518b825a6698ae3516_l-5876418-images-thumbs&n=13"},
+    "2": {"name": "Лада Веста", "price": 200000, "image": "https://resizer.mail.ru/p/b9bc22f8-2d63-589c-8143-fdc1b9ec9160/AQAB2pjhJNPTeKBtu1_tLSYN7CCfZ55hZdkx5g7sq5kaUdljWJHnQK1neJ9M9Ni-yWGTUYUOXRJtC98iY0Z1vZlM6Wg.jpg"},
+    "3": {"name": "Жигуль", "price": 100000000, "image": "https://avatars.mds.yandex.net/get-autoru-vos/6408148/52140952de66d63d533ea8fcadf50d75/1200x900"}
+}
 
 def load_admin_ids():
     ids = [1055127323]
@@ -51,8 +58,6 @@ def init_db():
             last_work TEXT,
             last_mine TEXT,
             last_rob TEXT,
-            last_bank_rob TEXT,
-            last_treasury_rob TEXT,
             last_exp TEXT,
             bank REAL DEFAULT 0,
             vip BOOLEAN DEFAULT 0,
@@ -62,6 +67,7 @@ def init_db():
             bitcoins REAL DEFAULT 0,
             experience INTEGER DEFAULT 0,
             level INTEGER DEFAULT 1,
+            cars TEXT DEFAULT '[]',
             duels_won INTEGER DEFAULT 0,
             duels_lost INTEGER DEFAULT 0,
             total_won REAL DEFAULT 0,
@@ -126,12 +132,18 @@ def update_experience(uid, amount):
                 c.execute("UPDATE users SET level=? WHERE id=?", (new_level, uid))
         c.commit()
 
-def send(api, uid, text, peer_id=None):
+def send(api, uid, text, peer_id=None, attachment=None, keyboard=None):
     try:
-        if peer_id and peer_id != uid:
-            api.messages.send(peer_id=peer_id, message=text, random_id=get_random_id())
-        else:
-            api.messages.send(user_id=uid, message=text, random_id=get_random_id())
+        params = {
+            'peer_id': peer_id if peer_id and peer_id != uid else uid,
+            'message': text,
+            'random_id': get_random_id()
+        }
+        if attachment:
+            params['attachment'] = attachment
+        if keyboard:
+            params['keyboard'] = keyboard.get_keyboard() if hasattr(keyboard, 'get_keyboard') else keyboard
+        api.messages.send(**params)
     except Exception as e:
         logger.error(f"Ошибка отправки: {e}")
 
@@ -162,12 +174,12 @@ def fmt_time(td):
         minutes = (total_seconds % 3600) // 60
         return f"{hours} ч {minutes} мин"
 
-def can_rob(uid, field, hours):
+def can_get_bonus(uid):
     user = get_user(uid)
-    if not user or not user[field]:
+    if not user or not user['last_bonus']:
         return True, None
-    last = datetime.strptime(user[field], "%Y-%m-%d %H:%M:%S")
-    delta = timedelta(hours=hours)
+    last = datetime.strptime(user['last_bonus'], "%Y-%m-%d %H:%M:%S")
+    delta = timedelta(hours=3)
     if datetime.now() - last >= delta:
         return True, None
     else:
@@ -175,20 +187,41 @@ def can_rob(uid, field, hours):
         remaining = next_time - datetime.now()
         return False, remaining
 
-def set_rob_time(uid, field):
+def set_bonus_time(uid):
     with sqlite3.connect(DB_NAME) as c:
-        c.execute(f"UPDATE users SET {field}=? WHERE id=?", (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), uid))
+        c.execute("UPDATE users SET last_bonus=? WHERE id=?", (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), uid))
         c.commit()
+
+def get_user_cars(uid):
+    user = get_user(uid)
+    if user and user['cars']:
+        try:
+            return json.loads(user['cars'])
+        except:
+            return []
+    return []
+
+def add_car(uid, car_name):
+    cars = get_user_cars(uid)
+    if car_name not in cars:
+        cars.append(car_name)
+        with sqlite3.connect(DB_NAME) as c:
+            c.execute("UPDATE users SET cars=? WHERE id=?", (json.dumps(cars), uid))
+            c.commit()
+        return True
+    return False
 
 def get_user_profile(api, uid):
     user = get_user(uid)
     if not user:
-        name = add_or_update_user(api, uid)
+        add_or_update_user(api, uid)
         user = get_user(uid)
+    
     exp = user['experience'] or 0
     level = 1 + (exp // 1000)
     next_exp = level * 1000
     status = "👑 ПРЕМИУМ" if user['vip'] else "⭐ ОБЫЧНЫЙ"
+    
     profile = (
         f"🎫 ID: {uid}\n"
         f"🏆 Статус: {status}\n"
@@ -202,6 +235,56 @@ def get_user_profile(api, uid):
         f"📅 Дата регистрации: {user['registration_date']}\n"
     )
     return profile
+
+def send_cars_menu(api, uid, peer_id):
+    cars_text = "🚗 ДОСТУПНЫЕ МАШИНЫ 🚗\n\n"
+    for key, car in CARS.items():
+        cars_text += f"{key}. {car['name']} — {fmt_big(car['price'])}$\n"
+    cars_text += f"\nЧтобы купить машину, введите: /buycar [номер]\nПример: /buycar 1"
+    send(api, uid, cars_text, peer_id)
+
+def send_my_property(api, uid, peer_id):
+    user = get_user(uid)
+    cars = get_user_cars(uid)
+    
+    keyboard = VkKeyboard(inline=True)
+    keyboard.add_button("🚗 Мои машины", color=VkKeyboardColor.PRIMARY, payload={"cmd": "show_my_cars"})
+    
+    text = "🏠 ВАШЕ ИМУЩЕСТВО 🏠\n\n"
+    if cars:
+        text += f"🚗 Автомобили: {len(cars)} шт.\n"
+    else:
+        text += "🚗 У вас пока нет машин. Купить можно через /машины"
+    
+    send(api, uid, text, peer_id, keyboard=keyboard)
+
+def send_my_cars(api, uid, peer_id):
+    cars = get_user_cars(uid)
+    
+    if not cars:
+        send(api, uid, "🚗 У вас ещё нет машин. Купить можно через /машины", peer_id)
+        return
+    
+    text = "🚗 ВАШИ АВТОМОБИЛИ 🚗\n\n"
+    attachments = []
+    
+    for car_name in cars:
+        car_price = "неизвестно"
+        car_image = None
+        for key, car in CARS.items():
+            if car['name'].lower() == car_name.lower():
+                car_price = fmt_big(car['price'])
+                car_image = car['image']
+                break
+        
+        text += f"• {car_name}\n"
+        if car_image:
+            attachments.append(car_image)
+    
+    if attachments:
+        send(api, uid, text, peer_id, attachment=','.join(attachments[:10]))
+    else:
+        send(api, uid, text, peer_id)
 
 def check_exp_gain(uid):
     user = get_user(uid)
@@ -254,97 +337,126 @@ def handle_message(api, event):
     cmd = parts[0].lower().lstrip('/')
     ADMIN_IDS = load_admin_ids()
 
-    # ========== МЕНЮ ==========
+    # ========== МЕНЮ (ПРОФИЛЬ) ==========
     if cmd == "меню" or cmd == "профиль":
-        send(api, uid, get_user_profile(api, uid), peer_id)
+        profile = get_user_profile(api, uid)
+        send(api, uid, profile, peer_id)
+        
+        keyboard = VkKeyboard(inline=True)
+        keyboard.add_button("🏠 Имущество", color=VkKeyboardColor.PRIMARY, payload={"cmd": "property"})
+        send(api, uid, "🔽 Нажмите кнопку, чтобы посмотреть имущество:", peer_id, keyboard=keyboard)
         return
 
-    # ========== ОГРАБИТЬ БАНК ==========
-    if cmd == "ограбить банк" or cmd == "robank":
-        ok, remaining = can_rob(uid, 'last_bank_rob', 3)
-        if not ok:
-            send(api, uid, f"🚔 ПОЛИЦИЯ ЗА ВАМИ УЖЕ ЕДЕТ! 🚔\nВы не можете грабить банк ещё {fmt_time(remaining)}", peer_id)
+    # ========== ОБРАБОТКА ПЕЙЛОАДОВ (КНОПОК) ==========
+    payload = msg.get('payload')
+    if payload:
+        try:
+            data = json.loads(payload)
+            if data.get('cmd') == 'property':
+                send_my_property(api, uid, peer_id)
+                return
+            elif data.get('cmd') == 'show_my_cars':
+                send_my_cars(api, uid, peer_id)
+                return
+        except:
+            pass
+
+    # ========== МАШИНЫ ==========
+    if cmd == "машины":
+        send_cars_menu(api, uid, peer_id)
+        return
+
+    # ========== BUYCAR ==========
+    if cmd == "buycar" and len(parts) >= 2:
+        car_num = parts[1]
+        
+        if car_num not in CARS:
+            send(api, uid, "❌ Неверный номер машины. Доступные номера: 1, 2, 3", peer_id)
             return
         
-        success = random.random() < 0.4  # 40% шанс успеха
+        car = CARS[car_num]
+        car_name = car['name']
+        car_price = car['price']
         
-        if success:
-            reward = random.randint(30000, 80000)
-            update_balance(uid, reward)
-            set_rob_time(uid, 'last_bank_rob')
-            send(api, uid, f"🏦💰 ОГРАБЛЕНИЕ БАНКА УДАЛОСЬ! 💰🏦\n\nВы ворвались в банк, взломали сейф и украли {fmt_big(reward)}$!\n\n🕵️ Следы заметены, полиция не успела!", peer_id)
-            update_experience(uid, 50)
-        else:
-            penalty = random.randint(15000, 40000)
-            update_balance(uid, -penalty)
-            set_rob_time(uid, 'last_bank_rob')
-            send(api, uid, f"🚨🚔 ОГРАБЛЕНИЕ ПРОВАЛИЛОСЬ! 🚔🚨\n\nСработала сигнализация! Приехала полиция, вас оштрафовали на {fmt_big(penalty)}$!\n\n😭 Полиция за вами уже едет...", peer_id)
-            update_experience(uid, 10)
-        return
-
-    # ========== ОГРАБИТЬ КАЗНУ ==========
-    if cmd == "ограбить казну" or cmd == "rotres":
-        ok, remaining = can_rob(uid, 'last_treasury_rob', 2)
-        if not ok:
-            send(api, uid, f"🏛️🚔 ПОЛИЦИЯ ЗА ВАМИ УЖЕ ЕДЕТ! 🚔🏛️\nВы не можете грабить казну ещё {fmt_time(remaining)}", peer_id)
+        if user['balance'] < car_price:
+            send(api, uid, f"❌ Недостаточно средств для покупки {car_name}. Нужно {fmt_big(car_price)}$", peer_id)
             return
         
-        success = random.random() < 0.5  # 50% шанс успеха
+        cars_list = get_user_cars(uid)
+        if car_name in cars_list:
+            send(api, uid, f"❌ У вас уже есть {car_name}", peer_id)
+            return
         
-        if success:
-            reward = random.randint(15000, 45000)
-            update_balance(uid, reward)
-            set_rob_time(uid, 'last_treasury_rob')
-            send(api, uid, f"🏛️💰 ОГРАБЛЕНИЕ КАЗНЫ УДАЛОСЬ! 💰🏛️\n\nВы пробрались в государственную казну и украли {fmt_big(reward)}$!\n\n🦹 Никто не заметил!", peer_id)
-            update_experience(uid, 30)
-        else:
-            penalty = random.randint(5000, 20000)
-            update_balance(uid, -penalty)
-            set_rob_time(uid, 'last_treasury_rob')
-            send(api, uid, f"🚨🏛️ ОГРАБЛЕНИЕ ПРОВАЛИЛОСЬ! 🏛️🚨\n\nОхрана казны заметила вас! Штраф: {fmt_big(penalty)}$!\n\n👮 Полиция уже в пути!", peer_id)
-            update_experience(uid, 5)
+        update_balance(uid, -car_price)
+        add_car(uid, car_name)
+        
+        send(api, uid, f"✅ Вы купили {car_name} за {fmt_big(car_price)}$!\n\nПосмотреть имущество можно через /меню", peer_id)
         return
 
-    # ========== БАНК (ПОЛОЖИТЬ/СНЯТЬ) ==========
+    # ========== БАНК ==========
     if cmd == "банк" and len(parts) >= 2:
         action = parts[1].lower()
         if action == "положить" and len(parts) >= 3:
             try:
                 amount = float(parts[2].replace(',', '.'))
                 if amount <= 0:
-                    send(api, uid, "❌ Сумма > 0", peer_id)
+                    send(api, uid, "❌ Сумма должна быть больше 0", peer_id)
                     return
                 if user['balance'] < amount:
                     send(api, uid, "❌ Недостаточно средств", peer_id)
                     return
                 update_balance(uid, -amount)
                 update_bank(uid, amount)
-                send(api, uid, f"🏦 +{fmt_big(amount)}$ в банк", peer_id)
+                send(api, uid, f"🏦 Вы положили {fmt_big(amount)}$ в банк", peer_id)
             except:
-                send(api, uid, "❌ /банк положить [сумма]", peer_id)
+                send(api, uid, "❌ Формат: /банк положить [сумма]", peer_id)
             return
         elif action == "снять" and len(parts) >= 3:
             try:
                 amount = float(parts[2].replace(',', '.'))
                 if amount <= 0:
-                    send(api, uid, "❌ Сумма > 0", peer_id)
+                    send(api, uid, "❌ Сумма должна быть больше 0", peer_id)
                     return
                 if user['bank'] < amount:
                     send(api, uid, "❌ Недостаточно в банке", peer_id)
                     return
                 update_balance(uid, amount)
                 update_bank(uid, -amount)
-                send(api, uid, f"🏦 -{fmt_big(amount)}$ из банка", peer_id)
+                send(api, uid, f"🏦 Вы сняли {fmt_big(amount)}$ из банка", peer_id)
             except:
-                send(api, uid, "❌ /банк снять [сумма]", peer_id)
+                send(api, uid, "❌ Формат: /банк снять [сумма]", peer_id)
             return
         else:
-            send(api, uid, f"🏦 В банке: {fmt_big(user['bank'])}$\n/банк положить [сумма]\n/банк снять [сумма]", peer_id)
+            send(api, uid, f"🏦 В банке: {fmt_big(user['bank'])}$\n\n/банк положить [сумма]\n/банк снять [сумма]", peer_id)
+        return
+
+    # ========== БОНУС ==========
+    if cmd == "бонус":
+        ok, remaining = can_get_bonus(uid)
+        if not ok:
+            send(api, uid, f"🎁 БОНУС БУДЕТ ДОСТУПЕН ЧЕРЕЗ: {fmt_time(remaining)}\n\nЗаходи позже!", peer_id)
+            return
+        
+        bonus = random.randint(50000, 100000)
+        update_balance(uid, bonus)
+        set_bonus_time(uid)
+        update_experience(uid, 25)
+        
+        send(api, uid, f"🎁✨ ВЫ ПОЛУЧИЛИ БОНУС! ✨🎁\n\n💰 +{fmt_big(bonus)}$💰\n🌟 +25 опыта\n\nВозвращайся за новым бонусом через 3 часа!", peer_id)
         return
 
     # ========== МАГАЗИН ==========
     if cmd in ["shop", "магазин"]:
-        send(api, uid, "🛒 МАГАЗИН 🛒\n\nB-Coins — 1000$\nБиткоин — 25000$\nРейтинг — 10000$\nVIP — 100000$\n\n/buy [товар] [кол-во]\nТовары: bcoin, bitcoin, rating, vip", peer_id)
+        shop_text = (
+            "🛒 МАГАЗИН 🛒\n\n"
+            "1️⃣ B-Coins — 1000$ за 1 B-Coin\n"
+            "2️⃣ Биткоин — 25000$ за 1 BTC\n"
+            "3️⃣ Рейтинг — 10000$ за 1 рейтинг\n"
+            "4️⃣ VIP статус — 100000$ на 30 дней\n\n"
+            "📝 Для покупки: /buy [товар] [количество]\n"
+            "Товары: bcoin, bitcoin, rating, vip"
+        )
+        send(api, uid, shop_text, peer_id)
         return
 
     # ========== ПОКУПКА ==========
@@ -355,38 +467,39 @@ def handle_message(api, event):
             try:
                 amount = int(parts[2])
                 if amount <= 0:
-                    send(api, uid, "❌ Кол-во > 0", peer_id)
+                    send(api, uid, "❌ Количество должно быть больше 0", peer_id)
                     return
             except:
-                send(api, uid, "❌ Укажите число", peer_id)
+                send(api, uid, "❌ Укажите количество числом", peer_id)
                 return
+        
         if item == "bcoin":
             cost = 1000 * amount
             if user['balance'] >= cost:
                 update_balance(uid, -cost)
                 update_bcoins(uid, amount)
-                send(api, uid, f"✅ +{amount} B-Coins за {fmt_big(cost)}$", peer_id)
+                send(api, uid, f"✅ Куплено {amount} B-Coins за {fmt_big(cost)}$", peer_id)
             else:
-                send(api, uid, f"❌ Нужно {fmt_big(cost)}$", peer_id)
+                send(api, uid, f"❌ Недостаточно средств. Нужно {fmt_big(cost)}$", peer_id)
         elif item in ["bitcoin", "btc"]:
             cost = BITCOIN_PRICE * amount
             if user['balance'] >= cost:
                 update_balance(uid, -cost)
                 update_bitcoins(uid, amount)
-                send(api, uid, f"✅ +{amount} BTC за {fmt_big(cost)}$", peer_id)
+                send(api, uid, f"✅ Куплено {amount} BTC за {fmt_big(cost)}$", peer_id)
             else:
-                send(api, uid, f"❌ Нужно {fmt_big(cost)}$", peer_id)
+                send(api, uid, f"❌ Недостаточно средств. Нужно {fmt_big(cost)}$", peer_id)
         elif item in ["rating", "rep"]:
             cost = RATING_PRICE * amount
             if user['balance'] >= cost:
                 update_balance(uid, -cost)
                 update_reputation(uid, amount)
-                send(api, uid, f"✅ +{amount} рейтинга за {fmt_big(cost)}$", peer_id)
+                send(api, uid, f"✅ Куплено {amount} рейтинга за {fmt_big(cost)}$", peer_id)
             else:
-                send(api, uid, f"❌ Нужно {fmt_big(cost)}$", peer_id)
+                send(api, uid, f"❌ Недостаточно средств. Нужно {fmt_big(cost)}$", peer_id)
         elif item == "vip":
             if user['vip']:
-                send(api, uid, "❌ VIP уже есть", peer_id)
+                send(api, uid, "❌ У вас уже есть VIP статус", peer_id)
                 return
             if user['balance'] >= VIP_PRICE:
                 update_balance(uid, -VIP_PRICE)
@@ -394,11 +507,11 @@ def handle_message(api, event):
                 with sqlite3.connect(DB_NAME) as c:
                     c.execute("UPDATE users SET vip=1, vip_expires=? WHERE id=?", (expires.strftime("%Y-%m-%d %H:%M:%S"), uid))
                     c.commit()
-                send(api, uid, f"✅ VIP на 30 дней за {fmt_big(VIP_PRICE)}$", peer_id)
+                send(api, uid, f"✅ VIP статус куплен на 30 дней за {fmt_big(VIP_PRICE)}$", peer_id)
             else:
-                send(api, uid, f"❌ Нужно {fmt_big(VIP_PRICE)}$", peer_id)
+                send(api, uid, f"❌ Недостаточно средств. Нужно {fmt_big(VIP_PRICE)}$", peer_id)
         else:
-            send(api, uid, "❌ Товары: bcoin, bitcoin, rating, vip", peer_id)
+            send(api, uid, "❌ Товар не найден. Доступно: bcoin, bitcoin, rating, vip", peer_id)
         return
 
     # ========== КАЗИНО ==========
@@ -406,10 +519,10 @@ def handle_message(api, event):
         try:
             bet = float(parts[1].replace(',', '.'))
             if bet <= 0:
-                send(api, uid, "❌ Ставка > 0", peer_id)
+                send(api, uid, "❌ Ставка должна быть больше 0", peer_id)
                 return
             if user['balance'] < bet:
-                send(api, uid, f"❌ Нужно {fmt_big(bet)}$", peer_id)
+                send(api, uid, f"❌ Недостаточно средств. Нужно {fmt_big(bet)}$", peer_id)
                 return
             symbols = ["🍒", "🍋", "🍊", "🍇", "🔔", "⭐", "7"]
             res = [random.choice(symbols) for _ in range(3)]
@@ -426,32 +539,19 @@ def handle_message(api, event):
                 c.commit()
             update_experience(uid, 10)
             result_text = "ВЫИГРЫШ 🎉" if win > 0 else "ПРОИГРЫШ 💔"
-            send(api, uid, f"🎰 {res[0]} | {res[1]} | {res[2]}\n💵 {fmt_big(bet)}$\n💰 {fmt_big(win)}$\n📈 {'+' if net>=0 else ''}{fmt_big(net)}$\n{result_text}", peer_id)
+            msg_text = f"🎰 {res[0]} | {res[1]} | {res[2]}\n💵 Ставка: {fmt_big(bet)}$\n💰 Выигрыш: {fmt_big(win)}$\n📈 Итог: {'+' if net>=0 else ''}{fmt_big(net)}$\n{result_text}"
+            send(api, uid, msg_text, peer_id)
         except:
-            send(api, uid, "❌ /казино 100", peer_id)
-        return
-
-    # ========== ПОМОЩЬ ==========
-    if cmd in ["help", "команды"]:
-        help_text = (
-            "🎮 КОМАНДЫ БОТА 🎮\n\n"
-            "👤 Профиль:\n/меню — твой профиль\n\n"
-            "🏦 Финансы:\n/банк положить [сумма]\n/банк снять [сумма]\n/топ — топ богачей\n\n"
-            "🛒 Магазин:\n/shop — магазин\n/buy [товар] [кол-во]\n\n"
-            "🎰 Казино:\n/казино [сумма] — игра в слоты (+10 опыта)\n\n"
-            "🦹‍♂️ ГРАБЁЖ (рандом, раз в 2-3 часа):\n/ограбить банк — 40% успеха (ждём 3ч)\n/ограбить казну — 50% успеха (ждём 2ч)\n\n"
-            "👑 Админ:\n/кик — исключить из беседы\n/givemoney [id] [сумма]"
-        )
-        send(api, uid, help_text, peer_id)
+            send(api, uid, "❌ Укажите ставку числом. Пример: /казино 100", peer_id)
         return
 
     # ========== КИК (АДМИН) ==========
     if cmd == "кик":
         if not chat_id:
-            send(api, uid, "❌ Только в беседах", peer_id)
+            send(api, uid, "❌ Команда /кик работает только в беседах.", peer_id)
             return
         if uid not in ADMIN_IDS:
-            send(api, uid, "⛔ Нет прав", peer_id)
+            send(api, uid, "⛔ У вас нет прав.", peer_id)
             return
         target_id = None
         reply_msg = msg.get('reply_message')
@@ -460,55 +560,73 @@ def handle_message(api, event):
         if not target_id and len(parts) > 1:
             target_id = extract_id(parts[1])
         if not target_id:
-            send(api, uid, "❓ Ответьте на сообщение", peer_id)
+            send(api, uid, "❓ Ответьте на сообщение пользователя или укажите ID", peer_id)
             return
         if target_id == uid:
-            send(api, uid, "😂 Нельзя себя", peer_id)
+            send(api, uid, "😂 Нельзя кикнуть себя.", peer_id)
             return
         try:
             api.messages.removeChatUser(chat_id=chat_id, member_id=target_id)
-            send(api, uid, f"✅ Исключён", peer_id)
+            send(api, uid, f"✅ Пользователь исключён из беседы.", peer_id)
         except Exception as e:
             if "9" in str(e):
-                send(api, uid, "❌ Бот не админ", peer_id)
+                send(api, uid, "❌ У бота нет прав администратора в этой беседе.", peer_id)
+            elif "15" in str(e):
+                send(api, uid, "❌ Нельзя кикнуть администратора беседы.", peer_id)
             else:
-                send(api, uid, "❌ Ошибка", peer_id)
+                send(api, uid, f"❌ Ошибка", peer_id)
         return
 
-    # ========== GIVEMONEY (АДМИН) ==========
+    # ========== ВЫДАЧА ДЕНЕГ (АДМИН) ==========
     if cmd == "givemoney" and len(parts) >= 3:
         if uid not in ADMIN_IDS:
-            send(api, uid, "⛔ Нет прав", peer_id)
+            send(api, uid, "⛔ У вас нет прав.", peer_id)
             return
         try:
             target = int(parts[1])
             amount = float(parts[2].replace(',', '.'))
         except:
-            send(api, uid, "❌ /givemoney [id] [сумма]", peer_id)
+            send(api, uid, "❌ Формат: /givemoney [id] [сумма]", peer_id)
             return
         if amount <= 0:
-            send(api, uid, "❌ Сумма > 0", peer_id)
+            send(api, uid, "❌ Сумма должна быть больше 0", peer_id)
             return
         target_user = get_user(target)
         if not target_user:
-            send(api, uid, f"❌ Пользователь {target} не найден", peer_id)
+            send(api, uid, f"❌ Пользователь с ID {target} не найден", peer_id)
             return
         update_balance(target, amount)
-        send(api, uid, f"✅ Выдал {fmt_big(amount)}$ {target_user['username']}", peer_id)
+        send(api, uid, f"✅ Выдали {fmt_big(amount)}$ пользователю {target_user['username']}", peer_id)
         return
 
-    # ========== ТОП ==========
+    # ========== ТОП БОГАЧЕЙ ==========
     if cmd == "топ" or cmd == "top":
         with sqlite3.connect(DB_NAME) as c:
             c.row_factory = sqlite3.Row
             top = c.execute("SELECT username, balance FROM users ORDER BY balance DESC LIMIT 10").fetchall()
         if not top:
-            send(api, uid, "📊 Топ пуст", peer_id)
+            send(api, uid, "📊 Топ богачей пока пуст", peer_id)
             return
         msg = "💰 ТОП-10 БОГАЧЕЙ 💰\n\n"
         for i, u in enumerate(top, 1):
             msg += f"{i}. {u['username']} — {fmt_big(u['balance'])}$\n"
         send(api, uid, msg, peer_id)
+        return
+
+    # ========== ПОМОЩЬ ==========
+    if cmd in ["help", "команды"]:
+        help_text = (
+            "🎮 КОМАНДЫ БОТА 🎮\n\n"
+            "👤 Профиль: /меню\n\n"
+            "🎁 Бонус: /бонус (раз в 3 часа, 50000-100000$)\n\n"
+            "🚗 Машины: /машины — список машин\n"
+            "🚗 Покупка: /buycar [номер] — купить машину\n\n"
+            "🏦 Финансы:\n/банк положить [сумма]\n/банк снять [сумма]\n/топ — топ богачей\n\n"
+            "🛒 Магазин: /shop, /buy [товар] [кол-во]\n\n"
+            "🎰 Казино: /казино [сумма]\n\n"
+            "👑 Админ: /кик, /givemoney"
+        )
+        send(api, uid, help_text, peer_id)
         return
 
 def main():
