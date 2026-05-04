@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+import random, sqlite3, logging, time, re, json
+from datetime import datetime, timedelta
+
+from vk_api import VkApi
+from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
+from vk_api.utils import get_random_id
+
+# ---------- КОНФИГ ----------
+VK_TOKEN = "vk1.a.wEVffgtJ5Szki-vnUgd_oPES5fId_uLZWo7-tDLy5sW5x-E52mZFzYxf3sC1RR6CWr6xue1FFYX0vJBr-saEW4Ym2W_gENt5WvwcqedTSDsccptFhzRpdWD1UC8brGpELjTdM5d7YLE1HNr0VUpqyZISY3Uy1NWp-wr4cooyTpLxYg5UOJiB2v5W3lJq_ZGlXve5zYzblSzeZO0ONA_tiQ"
+GROUP_ID = 238368566
+ADMIN_IDS_FILE = "admin_ids.txt"
+START_BALANCE = 50000.0
+VIP_PRICE = 100000
+VIP_DAYS = 30
+BITCOIN_PRICE = 25000
+RATING_PRICE = 10000
+EXP_PER_HOUR = 250
+
+DB_NAME = "casino_vk.db"
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def load_admin_ids():
+    ids = [1055127323]
+    try:
+        with open(ADMIN_IDS_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line.isdigit() and int(line) not in ids:
+                    ids.append(int(line))
+    except FileNotFoundError:
+        with open(ADMIN_IDS_FILE, 'w', encoding='utf-8') as f:
+            f.write("# Список ID администраторов\n")
+            f.write("1055127323\n")
+    return ids
+
+def init_db():
+    with sqlite3.connect(DB_NAME) as c:
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            username TEXT,
+            screen_name TEXT,
+            balance REAL DEFAULT 50000.0,
+            is_blocked BOOLEAN DEFAULT 0,
+            registration_date TEXT DEFAULT CURRENT_TIMESTAMP,
+            games_played INTEGER DEFAULT 0,
+            last_bonus TEXT,
+            last_work TEXT,
+            last_mine TEXT,
+            last_rob TEXT,
+            last_exp TEXT,
+            bank REAL DEFAULT 0,
+            vip BOOLEAN DEFAULT 0,
+            vip_expires TEXT,
+            reputation INTEGER DEFAULT 0,
+            bcoins REAL DEFAULT 0,
+            bitcoins REAL DEFAULT 0,
+            experience INTEGER DEFAULT 0,
+            level INTEGER DEFAULT 1,
+            duels_won INTEGER DEFAULT 0,
+            duels_lost INTEGER DEFAULT 0,
+            total_won REAL DEFAULT 0,
+            total_lost REAL DEFAULT 0,
+            total_sent REAL DEFAULT 0,
+            total_received REAL DEFAULT 0
+        );
+        """)
+        c.commit()
+
+def get_user(uid):
+    with sqlite3.connect(DB_NAME) as c:
+        c.row_factory = sqlite3.Row
+        return c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+
+def add_or_update_user(api, uid):
+    try:
+        info = api.users.get(user_ids=uid)
+        if info:
+            name = f"{info[0]['first_name']} {info[0]['last_name']}"
+        else:
+            name = f"id{uid}"
+    except:
+        name = f"id{uid}"
+    with sqlite3.connect(DB_NAME) as c:
+        c.execute("INSERT OR IGNORE INTO users(id, username) VALUES(?,?)", (uid, name))
+        c.commit()
+    return name
+
+def update_balance(uid, amount):
+    with sqlite3.connect(DB_NAME) as c:
+        c.execute("UPDATE users SET balance=balance+? WHERE id=?", (amount, uid))
+        c.commit()
+
+def update_bank(uid, amount):
+    with sqlite3.connect(DB_NAME) as c:
+        c.execute("UPDATE users SET bank=bank+? WHERE id=?", (amount, uid))
+        c.commit()
+
+def update_bcoins(uid, amount):
+    with sqlite3.connect(DB_NAME) as c:
+        c.execute("UPDATE users SET bcoins=bcoins+? WHERE id=?", (amount, uid))
+        c.commit()
+
+def update_bitcoins(uid, amount):
+    with sqlite3.connect(DB_NAME) as c:
+        c.execute("UPDATE users SET bitcoins=bitcoins+? WHERE id=?", (amount, uid))
+        c.commit()
+
+def update_reputation(uid, amount):
+    with sqlite3.connect(DB_NAME) as c:
+        c.execute("UPDATE users SET reputation=reputation+? WHERE id=?", (amount, uid))
+        c.commit()
+
+def update_experience(uid, amount):
+    with sqlite3.connect(DB_NAME) as c:
+        c.execute("UPDATE users SET experience=experience+? WHERE id=?", (amount, uid))
+        user = get_user(uid)
+        if user:
+            new_level = 1 + ((user['experience'] or 0) // 1000)
+            if new_level > (user['level'] or 1):
+                c.execute("UPDATE users SET level=? WHERE id=?", (new_level, uid))
+        c.commit()
+
+def send(api, uid, text, peer_id=None):
+    try:
+        if peer_id and peer_id != uid:
+            api.messages.send(peer_id=peer_id, message=text, random_id=get_random_id())
+        else:
+            api.messages.send(user_id=uid, message=text, random_id=get_random_id())
+    except Exception as e:
+        logger.error(f"Ошибка отправки: {e}")
+
+def extract_id(raw_str):
+    if not raw_str: return None
+    match = re.search(r'\[id(\d+)\|', raw_str)
+    if match: return int(match.group(1))
+    nums = re.findall(r'\d+', raw_str)
+    if nums: return int(nums[0])
+    return None
+
+def fmt_big(amount):
+    if amount is None: return "0"
+    if amount >= 1000000:
+        return f"{amount/1000000:.1f}M"
+    elif amount >= 1000:
+        return f"{int(amount)}" if amount == int(amount) else f"{amount:.2f}"
+    return f"{int(amount)}" if amount == int(amount) else f"{amount:.2f}".rstrip('0').rstrip('.')
+
+def get_user_profile(api, uid):
+    user = get_user(uid)
+    if not user:
+        name = add_or_update_user(api, uid)
+        user = get_user(uid)
+    exp = user['experience'] or 0
+    level = 1 + (exp // 1000)
+    next_exp = level * 1000
+    status = "👑 ПРЕМИУМ" if user['vip'] else "⭐ ОБЫЧНЫЙ"
+    profile = (
+        f"🎫 ID: {uid}\n"
+        f"🏆 Статус: {status}\n"
+        f"💰 Денег: {fmt_big(user['balance'])}$\n"
+        f"🏛 В банке: {fmt_big(user['bank'])}$\n"
+        f"💳 B-Coins: {fmt_big(user['bcoins'] or 0)}\n"
+        f"📀 Биткоины: {fmt_big(user['bitcoins'] or 0)}\n"
+        f"👑 Рейтинг: {user['reputation'] or 0}\n"
+        f"🌟 Опыт: {exp}/{next_exp} (Уровень {level})\n"
+        f"🎲 Всего сыграно игр: {user['games_played'] or 0}\n"
+        f"📅 Дата регистрации: {user['registration_date']}\n"
+    )
+    return profile
+
+def check_exp_gain(uid):
+    user = get_user(uid)
+    if not user: return
+    last_exp = user['last_exp']
+    now = datetime.now()
+    if last_exp:
+        try:
+            last = datetime.strptime(last_exp, "%Y-%m-%d %H:%M:%S")
+            hours_passed = int((now - last).total_seconds() // 3600)
+            if hours_passed >= 1:
+                exp_gain = hours_passed * EXP_PER_HOUR
+                update_experience(uid, exp_gain)
+                with sqlite3.connect(DB_NAME) as c:
+                    c.execute("UPDATE users SET last_exp=? WHERE id=?", (now.strftime("%Y-%m-%d %H:%M:%S"), uid))
+                    c.commit()
+        except:
+            pass
+    else:
+        with sqlite3.connect(DB_NAME) as c:
+            c.execute("UPDATE users SET last_exp=? WHERE id=?", (now.strftime("%Y-%m-%d %H:%M:%S"), uid))
+            c.commit()
+
+def handle_message(api, event):
+    msg = event.object.get('message', {})
+    uid = msg.get('from_id')
+    if not uid: return
+    text = msg.get('text', '').strip()
+    if not text: return
+    peer_id = msg.get('peer_id')
+    
+    chat_id = None
+    if peer_id and peer_id > 2000000000:
+        chat_id = peer_id - 2000000000
+
+    if peer_id and peer_id != uid and not text.startswith('/'):
+        return
+
+    user = get_user(uid)
+    if not user:
+        add_or_update_user(api, uid)
+        send(api, uid, f"🎰 Добро пожаловать! Баланс: {fmt_big(START_BALANCE)}$\n/меню", peer_id)
+        user = get_user(uid)
+    
+    if user and not user['is_blocked']:
+        check_exp_gain(uid)
+        user = get_user(uid)
+    
+    parts = text.split()
+    cmd = parts[0].lower().lstrip('/')
+    ADMIN_IDS = load_admin_ids()
+
+    if cmd == "меню" or cmd == "профиль":
+        send(api, uid, get_user_profile(api, uid), peer_id)
+        return
+
+    if cmd == "банк" and len(parts) >= 2:
+        action = parts[1].lower()
+        if action == "положить" and len(parts) >= 3:
+            try:
+                amount = float(parts[2].replace(',', '.'))
+                if amount <= 0:
+                    send(api, uid, "❌ Сумма > 0", peer_id)
+                    return
+                if user['balance'] < amount:
+                    send(api, uid, "❌ Недостаточно средств", peer_id)
+                    return
+                update_balance(uid, -amount)
+                update_bank(uid, amount)
+                send(api, uid, f"🏦 +{fmt_big(amount)}$ в банк", peer_id)
+            except:
+                send(api, uid, "❌ /банк положить [сумма]", peer_id)
+            return
+        elif action == "снять" and len(parts) >= 3:
+            try:
+                amount = float(parts[2].replace(',', '.'))
+                if amount <= 0:
+                    send(api, uid, "❌ Сумма > 0", peer_id)
+                    return
+                if user['bank'] < amount:
+                    send(api, uid, "❌ Недостаточно в банке", peer_id)
+                    return
+                update_balance(uid, amount)
+                update_bank(uid, -amount)
+                send(api, uid, f"🏦 -{fmt_big(amount)}$ из банка", peer_id)
+            except:
+                send(api, uid, "❌ /банк снять [сумма]", peer_id)
+            return
+        else:
+            send(api, uid, f"🏦 В банке: {fmt_big(user['bank'])}$\n/банк положить [сумма]\n/банк снять [сумма]", peer_id)
+        return
+
+    if cmd in ["shop", "магазин"]:
+        send(api, uid, "🛒 МАГАЗИН 🛒\n\nB-Coins — 1000$\nБиткоин — 25000$\nРейтинг — 10000$\nVIP — 100000$\n\n/buy [товар] [кол-во]\nТовары: bcoin, bitcoin, rating, vip", peer_id)
+        return
+
+    if cmd == "buy" and len(parts) >= 2:
+        item = parts[1].lower()
+        amount = 1
+        if len(parts) >= 3:
+            try:
+                amount = int(parts[2])
+                if amount <= 0:
+                    send(api, uid, "❌ Кол-во > 0", peer_id)
+                    return
+            except:
+                send(api, uid, "❌ Укажите число", peer_id)
+                return
+        if item == "bcoin":
+            cost = 1000 * amount
+            if user['balance'] >= cost:
+                update_balance(uid, -cost)
+                update_bcoins(uid, amount)
+                send(api, uid, f"✅ +{amount} B-Coins за {fmt_big(cost)}$", peer_id)
+            else:
+                send(api, uid, f"❌ Нужно {fmt_big(cost)}$", peer_id)
+        elif item in ["bitcoin", "btc"]:
+            cost = BITCOIN_PRICE * amount
+            if user['balance'] >= cost:
+                update_balance(uid, -cost)
+                update_bitcoins(uid, amount)
+                send(api, uid, f"✅ +{amount} BTC за {fmt_big(cost)}$", peer_id)
+            else:
+                send(api, uid, f"❌ Нужно {fmt_big(cost)}$", peer_id)
+        elif item in ["rating", "rep"]:
+            cost = RATING_PRICE * amount
+            if user['balance'] >= cost:
+                update_balance(uid, -cost)
+                update_reputation(uid, amount)
+                send(api, uid, f"✅ +{amount} рейтинга за {fmt_big(cost)}$", peer_id)
+            else:
+                send(api, uid, f"❌ Нужно {fmt_big(cost)}$", peer_id)
+        elif item == "vip":
+            if user['vip']:
+                send(api, uid, "❌ VIP уже есть", peer_id)
+                return
+            if user['balance'] >= VIP_PRICE:
+                update_balance(uid, -VIP_PRICE)
+                expires = datetime.now() + timedelta(days=VIP_DAYS)
+                with sqlite3.connect(DB_NAME) as c:
+                    c.execute("UPDATE users SET vip=1, vip_expires=? WHERE id=?", (expires.strftime("%Y-%m-%d %H:%M:%S"), uid))
+                    c.commit()
+                send(api, uid, f"✅ VIP на 30 дней за {fmt_big(VIP_PRICE)}$", peer_id)
+            else:
+                send(api, uid, f"❌ Нужно {fmt_big(VIP_PRICE)}$", peer_id)
+        else:
+            send(api, uid, "❌ Товары: bcoin, bitcoin, rating, vip", peer_id)
+        return
+
+    if cmd == "казино" and len(parts) >= 2:
+        try:
+            bet = float(parts[1].replace(',', '.'))
+            if bet <= 0:
+                send(api, uid, "❌ Ставка > 0", peer_id)
+                return
+            if user['balance'] < bet:
+                send(api, uid, f"❌ Нужно {fmt_big(bet)}$", peer_id)
+                return
+            symbols = ["🍒", "🍋", "🍊", "🍇", "🔔", "⭐", "7"]
+            res = [random.choice(symbols) for _ in range(3)]
+            if res[0] == res[1] == res[2]:
+                win = bet * 5
+            elif len(set(res)) == 2:
+                win = bet * 2
+            else:
+                win = 0
+            net = win - bet
+            update_balance(uid, net)
+            with sqlite3.connect(DB_NAME) as c:
+                c.execute("UPDATE users SET games_played=games_played+1 WHERE id=?", (uid,))
+                c.commit()
+            update_experience(uid, 10)
+            result_text = "ВЫИГРЫШ 🎉" if win > 0 else "ПРОИГРЫШ 💔"
+            send(api, uid, f"🎰 {res[0]} | {res[1]} | {res[2]}\n💵 {fmt_big(bet)}$\n💰 {fmt_big(win)}$\n📈 {'+' if net>=0 else ''}{fmt_big(net)}$\n{result_text}", peer_id)
+        except:
+            send(api, uid, "❌ /казино 100", peer_id)
+        return
+
+    if cmd == "кик":
+        if not chat_id:
+            send(api, uid, "❌ Только в беседах", peer_id)
+            return
+        if uid not in ADMIN_IDS:
+            send(api, uid, "⛔ Нет прав", peer_id)
+            return
+        target_id = None
+        reply_msg = msg.get('reply_message')
+        if reply_msg:
+            target_id = reply_msg['from_id']
+        if not target_id and len(parts) > 1:
+            target_id = extract_id(parts[1])
+        if not target_id:
+            send(api, uid, "❓ Ответьте на сообщение", peer_id)
+            return
+        if target_id == uid:
+            send(api, uid, "😂 Нельзя себя", peer_id)
+            return
+        try:
+            api.messages.removeChatUser(chat_id=chat_id, member_id=target_id)
+            send(api, uid, f"✅ Исключён", peer_id)
+        except Exception as e:
+            if "9" in str(e):
+                send(api, uid, "❌ Бот не админ", peer_id)
+            else:
+                send(api, uid, "❌ Ошибка", peer_id)
+        return
+
+    if cmd == "givemoney" and len(parts) >= 3:
+        if uid not in ADMIN_IDS:
+            send(api, uid, "⛔ Нет прав", peer_id)
+            return
+        try:
+            target = int(parts[1])
+            amount = float(parts[2].replace(',', '.'))
+        except:
+            send(api, uid, "❌ /givemoney [id] [сумма]", peer_id)
+            return
+        if amount <= 0:
+            send(api, uid, "❌ Сумма > 0", peer_id)
+            return
+        target_user = get_user(target)
+        if not target_user:
+            send(api, uid, f"❌ Пользователь {target} не найден", peer_id)
+            return
+        update_balance(target, amount)
+        send(api, uid, f"✅ Выдал {fmt_big(amount)}$ {target_user['username']}", peer_id)
+        return
+
+    if cmd == "топ" or cmd == "top":
+        with sqlite3.connect(DB_NAME) as c:
+            c.row_factory = sqlite3.Row
+            top = c.execute("SELECT username, balance FROM users ORDER BY balance DESC LIMIT 10").fetchall()
+        if not top:
+            send(api, uid, "📊 Топ пуст", peer_id)
+            return
+        msg = "💰 ТОП-10 💰\n"
+        for i, u in enumerate(top, 1):
+            msg += f"{i}. {u['username']} — {fmt_big(u['balance'])}$\n"
+        send(api, uid, msg, peer_id)
+        return
+
+    if cmd in ["help", "команды"]:
+        send(api, uid, "🎮 КОМАНДЫ 🎮\n/меню\n/казино [сумма]\n/банк положить/снять\n/shop\n/buy [товар]\n/топ\n/кик (админ)\n/givemoney [id] (админ)", peer_id)
+        return
+
+def main():
+    init_db()
+    logger.info("Запуск бота...")
+    vk_session = VkApi(token=VK_TOKEN, api_version="5.131")
+    while True:
+        try:
+            vk = vk_session.get_api()
+            logger.info("✅ Авторизация успешна!")
+            longpoll = VkBotLongPoll(vk_session, GROUP_ID)
+            logger.info("✅ Бот работает! Напиши /меню")
+            for event in longpoll.listen():
+                if event.type == VkBotEventType.MESSAGE_NEW:
+                    handle_message(vk, event)
+        except Exception as e:
+            logger.error(f"Ошибка: {e}")
+            time.sleep(5)
+            vk_session = VkApi(token=VK_TOKEN, api_version="5.131")
+
+if __name__ == "__main__":
+    main()

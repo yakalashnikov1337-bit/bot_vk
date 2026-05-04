@@ -1,0 +1,11 @@
+services:
+  - type: worker
+    name: vk-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: VK_TOKEN
+        value: vk1.a.wEVffgtJ5Szki-vnUgd_oPES5fId_uLZWo7-tDLy5sW5x-E52mZFzYxf3sC1RR6CWr6xue1FFYX0vJBr-saEW4Ym2W_gENt5WvwcqedTSDsccptFhzRpdWD1UC8brGpELjTdM5d7YLE1HNr0VUpqyZISY3Uy1NWp-wr4cooyTpLxYg5UOJiB2v5W3lJq_ZGlXve5zYzblSzeZO0ONA_tiQ
+      - key: GROUP_ID
+        value: "238368566"
