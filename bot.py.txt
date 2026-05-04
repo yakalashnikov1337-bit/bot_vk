@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import random, sqlite3, logging, time, re, json
 from datetime import datetime, timedelta
 
@@ -22,11 +23,11 @@ DB_NAME = "casino_vk.db"
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Словарь с автомобилями
+# Словарь с автомобилями и фото
 CARS = {
-    "1": {"name": "Самокат", "price": 10000, "image": "https://avatars.mds.yandex.net/i?id=c6b01f469c7fc1518b825a6698ae3516_l-5876418-images-thumbs&n=13"},
-    "2": {"name": "Лада Веста", "price": 200000, "image": "https://resizer.mail.ru/p/b9bc22f8-2d63-589c-8143-fdc1b9ec9160/AQAB2pjhJNPTeKBtu1_tLSYN7CCfZ55hZdkx5g7sq5kaUdljWJHnQK1neJ9M9Ni-yWGTUYUOXRJtC98iY0Z1vZlM6Wg.jpg"},
-    "3": {"name": "Жигуль", "price": 100000000, "image": "https://avatars.mds.yandex.net/get-autoru-vos/6408148/52140952de66d63d533ea8fcadf50d75/1200x900"}
+    "1": {"name": "Самокат", "price": 10000, "emoji": "🛴", "photo": "photo1055127323_457243894"},
+    "2": {"name": "Лада Веста", "price": 200000, "emoji": "🚗", "photo": "photo1055127323_457243896"},
+    "3": {"name": "Жигуль", "price": 100000000, "emoji": "🚙", "photo": "photo1055127323_457243895"}
 }
 
 def load_admin_ids():
@@ -142,7 +143,7 @@ def send(api, uid, text, peer_id=None, attachment=None, keyboard=None):
         if attachment:
             params['attachment'] = attachment
         if keyboard:
-            params['keyboard'] = keyboard.get_keyboard() if hasattr(keyboard, 'get_keyboard') else keyboard
+            params['keyboard'] = keyboard.get_keyboard()
         api.messages.send(**params)
     except Exception as e:
         logger.error(f"Ошибка отправки: {e}")
@@ -168,7 +169,9 @@ def fmt_time(td):
     if total_seconds < 60:
         return f"{total_seconds} сек"
     elif total_seconds < 3600:
-        return f"{total_seconds // 60} мин {total_seconds % 60} сек"
+        minutes = total_seconds // 60
+        seconds = total_seconds % 60
+        return f"{minutes} мин {seconds} сек"
     else:
         hours = total_seconds // 3600
         minutes = (total_seconds % 3600) // 60
@@ -236,56 +239,6 @@ def get_user_profile(api, uid):
     )
     return profile
 
-def send_cars_menu(api, uid, peer_id):
-    cars_text = "🚗 ДОСТУПНЫЕ МАШИНЫ 🚗\n\n"
-    for key, car in CARS.items():
-        cars_text += f"{key}. {car['name']} — {fmt_big(car['price'])}$\n"
-    cars_text += f"\nЧтобы купить машину, введите: /buycar [номер]\nПример: /buycar 1"
-    send(api, uid, cars_text, peer_id)
-
-def send_my_property(api, uid, peer_id):
-    user = get_user(uid)
-    cars = get_user_cars(uid)
-    
-    keyboard = VkKeyboard(inline=True)
-    keyboard.add_button("🚗 Мои машины", color=VkKeyboardColor.PRIMARY, payload={"cmd": "show_my_cars"})
-    
-    text = "🏠 ВАШЕ ИМУЩЕСТВО 🏠\n\n"
-    if cars:
-        text += f"🚗 Автомобили: {len(cars)} шт.\n"
-    else:
-        text += "🚗 У вас пока нет машин. Купить можно через /машины"
-    
-    send(api, uid, text, peer_id, keyboard=keyboard)
-
-def send_my_cars(api, uid, peer_id):
-    cars = get_user_cars(uid)
-    
-    if not cars:
-        send(api, uid, "🚗 У вас ещё нет машин. Купить можно через /машины", peer_id)
-        return
-    
-    text = "🚗 ВАШИ АВТОМОБИЛИ 🚗\n\n"
-    attachments = []
-    
-    for car_name in cars:
-        car_price = "неизвестно"
-        car_image = None
-        for key, car in CARS.items():
-            if car['name'].lower() == car_name.lower():
-                car_price = fmt_big(car['price'])
-                car_image = car['image']
-                break
-        
-        text += f"• {car_name}\n"
-        if car_image:
-            attachments.append(car_image)
-    
-    if attachments:
-        send(api, uid, text, peer_id, attachment=','.join(attachments[:10]))
-    else:
-        send(api, uid, text, peer_id)
-
 def check_exp_gain(uid):
     user = get_user(uid)
     if not user: return
@@ -326,7 +279,7 @@ def handle_message(api, event):
     user = get_user(uid)
     if not user:
         add_or_update_user(api, uid)
-        send(api, uid, f"🎰 Добро пожаловать! Баланс: {fmt_big(START_BALANCE)}$\n/меню", peer_id)
+        send(api, uid, f"🎰 Добро пожаловать! Баланс: {fmt_big(START_BALANCE)}$\n\n📋 Команды:\n/меню - профиль\n/бонус - получить бонус\n/машины - купить машину", peer_id)
         user = get_user(uid)
     
     if user and not user['is_blocked']:
@@ -340,38 +293,72 @@ def handle_message(api, event):
     # ========== МЕНЮ (ПРОФИЛЬ) ==========
     if cmd == "меню" or cmd == "профиль":
         profile = get_user_profile(api, uid)
-        send(api, uid, profile, peer_id)
         
         keyboard = VkKeyboard(inline=True)
-        keyboard.add_button("🏠 Имущество", color=VkKeyboardColor.PRIMARY, payload={"cmd": "property"})
-        send(api, uid, "🔽 Нажмите кнопку, чтобы посмотреть имущество:", peer_id, keyboard=keyboard)
+        keyboard.add_button("🚗 Имущество", color=VkKeyboardColor.PRIMARY, payload={"cmd": "property"})
+        
+        send(api, uid, profile, peer_id)
+        send(api, uid, "🔽 Нажмите на кнопку, чтобы посмотреть имущество:", peer_id, keyboard=keyboard)
         return
 
-    # ========== ОБРАБОТКА ПЕЙЛОАДОВ (КНОПОК) ==========
+    # ========== ОБРАБОТКА КНОПОК (ПЕЙЛОАДОВ) ==========
     payload = msg.get('payload')
     if payload:
         try:
             data = json.loads(payload)
             if data.get('cmd') == 'property':
-                send_my_property(api, uid, peer_id)
+                cars = get_user_cars(uid)
+                if not cars:
+                    send(api, uid, "🏠 ВАШЕ ИМУЩЕСТВО 🏠\n\nУ вас пока нет машин.\nКупить можно через /машины", peer_id)
+                    return
+                
+                keyboard = VkKeyboard(inline=True)
+                keyboard.add_button("🚗 Мои машины", color=VkKeyboardColor.PRIMARY, payload={"cmd": "show_cars"})
+                send(api, uid, f"🏠 ВАШЕ ИМУЩЕСТВО 🏠\n\n🚗 Автомобилей: {len(cars)} шт.", peer_id, keyboard=keyboard)
                 return
-            elif data.get('cmd') == 'show_my_cars':
-                send_my_cars(api, uid, peer_id)
+                
+            elif data.get('cmd') == 'show_cars':
+                cars = get_user_cars(uid)
+                if not cars:
+                    send(api, uid, "🚗 У вас нет машин.", peer_id)
+                    return
+                
+                # Собираем фото всех машин
+                attachments = []
+                text = "🚗 ВАШИ АВТОМОБИЛИ 🚗\n\n"
+                
+                for car_name in cars:
+                    for key, car in CARS.items():
+                        if car['name'].lower() == car_name.lower():
+                            text += f"{car['emoji']} {car_name}\n"
+                            attachments.append(car['photo'])
+                            break
+                    else:
+                        text += f"🚗 {car_name}\n"
+                
+                if attachments:
+                    send(api, uid, text, peer_id, attachment=','.join(attachments))
+                else:
+                    send(api, uid, text, peer_id)
                 return
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Ошибка payload: {e}")
 
-    # ========== МАШИНЫ ==========
+    # ========== МАШИНЫ (СПИСОК ДОСТУПНЫХ) ==========
     if cmd == "машины":
-        send_cars_menu(api, uid, peer_id)
+        cars_text = "🚗 ДОСТУПНЫЕ МАШИНЫ 🚗\n\n"
+        for key, car in CARS.items():
+            cars_text += f"{key}. {car['emoji']} {car['name']} — {fmt_big(car['price'])}$\n"
+        cars_text += f"\nЧтобы купить машину, введите: /buycar [номер]\nПример: /buycar 1"
+        send(api, uid, cars_text, peer_id)
         return
 
-    # ========== BUYCAR ==========
+    # ========== BUYCAR (ПОКУПКА МАШИНЫ) ==========
     if cmd == "buycar" and len(parts) >= 2:
         car_num = parts[1]
         
         if car_num not in CARS:
-            send(api, uid, "❌ Неверный номер машины. Доступные номера: 1, 2, 3", peer_id)
+            send(api, uid, "❌ Неверный номер. Доступны: 1, 2, 3", peer_id)
             return
         
         car = CARS[car_num]
@@ -379,18 +366,34 @@ def handle_message(api, event):
         car_price = car['price']
         
         if user['balance'] < car_price:
-            send(api, uid, f"❌ Недостаточно средств для покупки {car_name}. Нужно {fmt_big(car_price)}$", peer_id)
+            send(api, uid, f"❌ Недостаточно денег для покупки {car['emoji']} {car_name}. Нужно {fmt_big(car_price)}$", peer_id)
             return
         
         cars_list = get_user_cars(uid)
         if car_name in cars_list:
-            send(api, uid, f"❌ У вас уже есть {car_name}", peer_id)
+            send(api, uid, f"❌ У вас уже есть {car['emoji']} {car_name}", peer_id)
             return
         
         update_balance(uid, -car_price)
         add_car(uid, car_name)
         
-        send(api, uid, f"✅ Вы купили {car_name} за {fmt_big(car_price)}$!\n\nПосмотреть имущество можно через /меню", peer_id)
+        # Отправляем фото купленной машины
+        send(api, uid, f"✅ Вы купили {car['emoji']} {car_name} за {fmt_big(car_price)}$!\n\nПосмотреть имущество можно через /меню", peer_id, attachment=car['photo'])
+        return
+
+    # ========== БОНУС ==========
+    if cmd == "бонус":
+        ok, remaining = can_get_bonus(uid)
+        if not ok:
+            send(api, uid, f"🎁 БОНУС БУДЕТ ДОСТУПЕН ЧЕРЕЗ: {fmt_time(remaining)}\n\nЗаходи позже!", peer_id)
+            return
+        
+        bonus = random.randint(50000, 100000)
+        update_balance(uid, bonus)
+        set_bonus_time(uid)
+        update_experience(uid, 25)
+        
+        send(api, uid, f"🎁✨ ВЫ ПОЛУЧИЛИ БОНУС! ✨🎁\n\n💰 +{fmt_big(bonus)}$\n🌟 +25 опыта\n\nВозвращайся за новым бонусом через 3 часа!", peer_id)
         return
 
     # ========== БАНК ==========
@@ -430,21 +433,6 @@ def handle_message(api, event):
             send(api, uid, f"🏦 В банке: {fmt_big(user['bank'])}$\n\n/банк положить [сумма]\n/банк снять [сумма]", peer_id)
         return
 
-    # ========== БОНУС ==========
-    if cmd == "бонус":
-        ok, remaining = can_get_bonus(uid)
-        if not ok:
-            send(api, uid, f"🎁 БОНУС БУДЕТ ДОСТУПЕН ЧЕРЕЗ: {fmt_time(remaining)}\n\nЗаходи позже!", peer_id)
-            return
-        
-        bonus = random.randint(50000, 100000)
-        update_balance(uid, bonus)
-        set_bonus_time(uid)
-        update_experience(uid, 25)
-        
-        send(api, uid, f"🎁✨ ВЫ ПОЛУЧИЛИ БОНУС! ✨🎁\n\n💰 +{fmt_big(bonus)}$💰\n🌟 +25 опыта\n\nВозвращайся за новым бонусом через 3 часа!", peer_id)
-        return
-
     # ========== МАГАЗИН ==========
     if cmd in ["shop", "магазин"]:
         shop_text = (
@@ -459,7 +447,7 @@ def handle_message(api, event):
         send(api, uid, shop_text, peer_id)
         return
 
-    # ========== ПОКУПКА ==========
+    # ========== ПОКУПКА (МАГАЗИН) ==========
     if cmd == "buy" and len(parts) >= 2:
         item = parts[1].lower()
         amount = 1
@@ -619,8 +607,7 @@ def handle_message(api, event):
             "🎮 КОМАНДЫ БОТА 🎮\n\n"
             "👤 Профиль: /меню\n\n"
             "🎁 Бонус: /бонус (раз в 3 часа, 50000-100000$)\n\n"
-            "🚗 Машины: /машины — список машин\n"
-            "🚗 Покупка: /buycar [номер] — купить машину\n\n"
+            "🚗 Машины:\n/машины — список доступных\n/buycar [номер] — купить (1-3)\n\n"
             "🏦 Финансы:\n/банк положить [сумма]\n/банк снять [сумма]\n/топ — топ богачей\n\n"
             "🛒 Магазин: /shop, /buy [товар] [кол-во]\n\n"
             "🎰 Казино: /казино [сумма]\n\n"
